@@ -50,6 +50,8 @@ with tempfile.TemporaryDirectory(prefix="sidestore-import-check-") as directory:
     with zipfile.ZipFile(work / "Invalid.ipa", "w") as archive:
         archive.writestr("Payload/Fixture.app/Info.plist", plistlib.dumps({"CFBundleName": "Missing ID"}))
     app = (root / "AltStore/Managing Apps/AppManager.swift").read_text()
+    handler = (root / "SideStore/DeepLinks/FileImportHandler.swift").read_text()
+    picker = (root / "AltStore/My Apps/MyAppsViewController.swift").read_text()
     pipeline = (root / "SideStore/Core/Operations/PipelineRunner.swift").read_text()
     swift = (root / "Checks/ImportRegressionCheck.swift").read_text()
     swift = swift.replace("// APP_MANAGER_METHODS", method(app, "private func resolveApp(for") + "\n" + method(app, "private static func readAppMetadata("))
@@ -57,6 +59,8 @@ with tempfile.TemporaryDirectory(prefix="sidestore-import-check-") as directory:
     start = pipeline.index("    @discardableResult\n    func performSingleOperation(")
     end = pipeline.index("    func performVoidOperation(", start)
     swift = swift.replace("// PIPELINE_RUNNER_METHODS", pipeline[start:end])
+    swift = swift.replace("// FILE_IMPORT_METHOD", method(handler, "private func handleIPAImport("))
+    swift = swift.replace("// DOCUMENT_PICKER_METHOD", method(picker, "func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt"))
     (work / "Check.swift").write_text(swift)
     subprocess.run(["swiftc", "-parse-as-library", "-swift-version", "5",
                     str(work / "Check.swift"), str(root / "AltStore/Extensions/FileManager+URLs.swift"),

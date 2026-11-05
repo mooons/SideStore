@@ -7,6 +7,15 @@ struct CheckFailure: Error, CustomStringConvertible { let description: String }
 func expect(_ value: Bool, _ message: String) throws {
     if !value { throw CheckFailure(description: message) }
 }
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Value
+    init(_ value: Value) { storage = value }
+    var value: Value {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+}
 enum OperationError: Error {
     case invalidApp(reason: String), cancelled, unknownResult
 }
@@ -99,17 +108,52 @@ final class AppManager {
     func makePipelineHandler(presentingViewController: UIViewController?) -> PipelineExecutionHandler { PipelineExecutionHandler() }
     func getValidDbContext(_ context: NSManagedObjectContext?) -> NSManagedObjectContext { context ?? NSManagedObjectContext() }
     func resolve(_ target: InstallTarget) async throws -> AppProtocol {
-        try await resolveApp(for: target)
+        let directory = FileManager.default.uniqueTemporaryURL()
+        do { return try await resolveApp(for: target, importDirectory: directory) }
+        catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
     // APP_MANAGER_METHODS
     // INSTALL_METHOD
 }
 
+final class UIDocumentPickerViewController {}
 final class UIApplication {
+    enum State { case active }
     static let shared = UIApplication()
+    let applicationState = State.active
     func open(_ url: URL) {}
 }
 extension UserDefaults { var isAutoLaunchAppAfterInstallEnabled: Bool { false } }
+enum AppDelegate {
+    static let importAppDeepLinkNotification = Notification.Name("ImportRegression")
+    static let importAppDeepLinkURLKey = "url"
+}
+enum InstallAppDialog {
+    static var confirm: (() -> Void)?
+    static func present(ipaURL: URL, from: AnyObject, onConfirm: @escaping () -> Void) { confirm = onConfirm }
+}
+final class ToastView {
+    init(text: String, detailText: String?) {}
+    func show(in controller: MyAppsViewController) {}
+}
+final class FileImportHandler {
+    static let shared = FileImportHandler()
+    var pendingImportIPAURL: URL?
+    func handle(fileURL: URL) -> Bool { handleIPAImport(fileURL: fileURL) }
+    // FILE_IMPORT_METHOD
+}
+// Notification delivery in this check is synchronous, as with the main UI.
+final class MyAppsViewController: @unchecked Sendable {
+    var installedBytes: Data?
+    func sideloadApp(at url: URL, completion: (Result<Void, Error>) -> Void) {
+        do { installedBytes = try Data(contentsOf: url); completion(.success(())) }
+        catch { completion(.failure(error)) }
+    }
+    // DOCUMENT_PICKER_METHOD
+}
 
 @main
 struct ImportRegressionCheck {
@@ -156,29 +200,52 @@ struct ImportRegressionCheck {
                 try expect(!FileManager.default.fileExists(atPath: staged.deletingLastPathComponent().path), "prepared download directory was not cleaned up")
 
                 let runner = PipelineRunner()
-                var cleaned = false
+                let cleaned = Locked(false)
                 var failures = 0
                 let cancelled = runner.performSingleOperation(resolving: {
                     try await Task.sleep(nanoseconds: 10_000_000_000)
                     return .install(source)
-                }, cleanup: { cleaned = true }, handler: PipelineExecutionHandler(), dbContext: NSManagedObjectContext()) { result in
+                }, cleanup: { cleaned.value = true }, handler: PipelineExecutionHandler(), dbContext: NSManagedObjectContext()) { result in
                     if case .failure = result { failures += 1 }
                 }
                 cancelled.cancel()
                 await cancelled.activeTask?.value
-                try expect(cleaned && failures == 1 && runner.receivedApp == nil, "preparation cancellation did not clean up and finish exactly once")
-                cleaned = false
+                try expect(cleaned.value && failures == 1 && runner.receivedApp == nil, "preparation cancellation did not clean up and finish exactly once")
+                cleaned.value = false
                 failures = 0
                 let failed = runner.performSingleOperation(resolving: {
                     throw OperationError.invalidApp(reason: "fixture preparation failure")
-                }, cleanup: { cleaned = true }, handler: PipelineExecutionHandler(), dbContext: NSManagedObjectContext()) { result in
+                }, cleanup: { cleaned.value = true }, handler: PipelineExecutionHandler(), dbContext: NSManagedObjectContext()) { result in
                     if case .failure = result { failures += 1 }
                 }
                 await failed.activeTask?.value
-                try expect(cleaned && failures == 1 && runner.receivedApp == nil, "preparation failure did not clean up and finish exactly once")
+                try expect(cleaned.value && failures == 1 && runner.receivedApp == nil, "preparation failure did not clean up and finish exactly once")
                 print("PASS: prepared install lifetime, completion, cancellation and failure cleanup")
             }
-
+            if selected == "files" || selected == "all" {
+                let controller = MyAppsViewController()
+                let importedURL = Locked<URL?>(nil)
+                let observer = NotificationCenter.default.addObserver(forName: AppDelegate.importAppDeepLinkNotification, object: nil, queue: nil) { notification in
+                    let url = notification.userInfo![AppDelegate.importAppDeepLinkURLKey] as! URL
+                    importedURL.value = url
+                    InstallAppDialog.present(ipaURL: url, from: controller) { controller.sideloadApp(at: url) { _ in } }
+                }
+                defer {
+                    NotificationCenter.default.removeObserver(observer)
+                    if let importedURL = importedURL.value { try? FileManager.default.removeItem(at: importedURL.deletingLastPathComponent()) }
+                }
+                let inbox = root.appendingPathComponent("Inbox.ipa")
+                let expected = try Data(contentsOf: root.appendingPathComponent("Fixture.ipa"))
+                try expected.write(to: inbox)
+                controller.documentPicker(UIDocumentPickerViewController(), didPickDocumentsAt: [inbox])
+                try FileManager.default.removeItem(at: inbox)
+                InstallAppDialog.confirm?()
+                try expect(controller.installedBytes == expected, "Files import lost its IPA when the original Inbox URL disappeared")
+                InstallAppDialog.confirm = nil
+                controller.documentPicker(UIDocumentPickerViewController(), didPickDocumentsAt: [inbox])
+                try expect(InstallAppDialog.confirm == nil, "failed staging still presented an install confirmation")
+                print("PASS: delayed Files confirmation survives removal of the Inbox file")
+            }
         } catch {
             FileHandle.standardError.write(Data("FAIL: \(error)\n".utf8))
             exit(1)

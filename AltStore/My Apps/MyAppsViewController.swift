@@ -2811,11 +2811,14 @@ extension MyAppsViewController: UIDocumentPickerDelegate
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL])
     {
         guard let fileURL = urls.first else { return }
-        
-        InstallAppDialog.present(ipaURL: fileURL, from: self) { [weak self] in
-            self?.sideloadApp(at: fileURL) { (result) in
-                debugLog("Sideloaded app at \(fileURL) with result: \(result)")
-            }
+
+        // Stage the provider URL before confirmation defers installation.
+        // Cloud-provider lifetimes still need proper testing on iOS.
+        guard FileImportHandler.shared.handle(fileURL: fileURL) else {
+            let toast = ToastView(text: NSLocalizedString("Failed to Import App", comment: ""),
+                                  detailText: NSLocalizedString("The selected file could not be copied. Please select it again.", comment: ""))
+            toast.show(in: self)
+            return
         }
     }
 }
