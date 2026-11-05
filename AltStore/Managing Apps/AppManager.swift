@@ -452,9 +452,15 @@ final class AppManager: ObservableObject, @unchecked Sendable
         let pipelineHandler = self.makePipelineHandler(presentingViewController: presentingViewController)
         let dbContext = self.getValidDbContext(dbBackgroundContext ?? context?.dbBackgroundContext)
 
-        let app = self.resolveApp(for: target)
+        let importDirectory = FileManager.default.uniqueTemporaryURL()
         return self.pipelineRunner.performSingleOperation(
-            .install(app),
+            resolving: {
+                let app = try await self.resolveApp(for: target, importDirectory: importDirectory)
+                return .install(app)
+            },
+            cleanup: {
+                try? FileManager.default.removeItem(at: importDirectory)
+            },
             handler: pipelineHandler,
             dbContext: dbContext,
             completionHandler: { result in
@@ -470,18 +476,33 @@ final class AppManager: ObservableObject, @unchecked Sendable
         )
     }
 
-    private func resolveApp(for target: InstallTarget) -> AppProtocol {
+    private func resolveApp(for target: InstallTarget,
+                            importDirectory: URL = FileManager.default.uniqueTemporaryURL()) async throws -> AppProtocol {
         switch target {
         case .app(let app):
             return app
         case .url(let url):
-            if url.isFileURL,
-               let packageType = PackageType(url: url),
-               let (bundleID, appName) = try? Self.readAppMetadata(from: url, packageType: packageType) {
-                return AnyApp(name: appName, bundleIdentifier: bundleID, url: url, storeApp: nil)
+            let fileURL: URL
+            if url.isFileURL {
+                fileURL = url
+            } else {
+                try FileManager.default.createDirectory(at: importDirectory, withIntermediateDirectories: true)
+                let (download, response) = try await URLSession.shared.download(from: url)
+                defer { try? FileManager.default.removeItem(at: download) }
+                try Task.checkCancellation()
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200..<300).contains(httpResponse.statusCode) else {
+                    throw URLError(.badServerResponse)
+                }
+                // URL filenames and redirects are not application identities.
+                fileURL = importDirectory.appendingPathComponent("App.ipa")
+                try FileManager.default.moveItem(at: download, to: fileURL)
             }
-            let name = url.deletingPathExtension().lastPathComponent
-            return AnyApp(name: name, bundleIdentifier: name, url: url, storeApp: nil)
+            guard let packageType = PackageType(url: fileURL) else {
+                throw OperationError.invalidApp(reason: "Unsupported app package type")
+            }
+            let (bundleID, appName) = try Self.readAppMetadata(from: fileURL, packageType: packageType)
+            return AnyApp(name: appName, bundleIdentifier: bundleID, url: fileURL, storeApp: nil)
         }
     }
 

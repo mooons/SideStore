@@ -49,6 +49,17 @@ final class PipelineRunner: Sendable
                                 dbContext: NSManagedObjectContext,
                                 completionHandler: @escaping (Result<InstalledApp, Error>) -> Void) -> RefreshGroup
     {
+        self.performSingleOperation(resolving: { operation }, handler: handler,
+                                    dbContext: dbContext, completionHandler: completionHandler)
+    }
+
+    @discardableResult
+    func performSingleOperation(resolving resolveOperation: @escaping @Sendable () async throws -> AppOperation,
+                                cleanup: @escaping @Sendable () -> Void = {},
+                                handler: PipelineExecutionHandler,
+                                dbContext: NSManagedObjectContext,
+                                completionHandler: @escaping (Result<InstalledApp, Error>) -> Void) -> RefreshGroup
+    {
         let group = RefreshGroup(dbContext: dbContext)
         group.completionHandler = { (results) in
             do
@@ -64,18 +75,20 @@ final class PipelineRunner: Sendable
                 completionHandler(.failure(error))
             }
         }
-        debugLog("[AppManager] performSingleOperation started for: \(operation.bundleIdentifier)")
         group.activeTask = Task.detached {
+            defer { cleanup() }
             do {
+                let operation = try await resolveOperation()
+                try Task.checkCancellation()
                 debugLog("[AppManager] performSingleOperation executing task for: \(operation.bundleIdentifier)")
                 try await self.perform([operation], handler: handler, group: group)
             } catch {
                 if Task.isCancelled || error is CancellationError {
-                    debugLog("[AppManager] performSingleOperation task CANCELLED for: \(operation.bundleIdentifier)")
+                    debugLog("[AppManager] performSingleOperation task CANCELLED")
                     completionHandler(.failure(OperationError.cancelled))
                     return
                 }
-                debugLog("[AppManager] performSingleOperation task failed for: \(operation.bundleIdentifier) with error: \(error)")
+                debugLog("[AppManager] performSingleOperation task failed with error: \(error)")
                 completionHandler(.failure(error))
             }
         }
